@@ -17,4 +17,5 @@ This is an ongoing R&D project for mitigating injury risk for soccer player by l
 The script will install all requirements.
 
 Once done, run the import, loading and subprocess cells from the SAM notebook.
+
 **NOTE: THE SCRIPT DOES NOT INSTALL DEPENDENCIES IN A SEPARATE VIRTUAL ENVIRONMENT**
