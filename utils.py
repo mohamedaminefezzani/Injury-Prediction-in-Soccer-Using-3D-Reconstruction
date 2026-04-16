@@ -8,6 +8,20 @@ from sam_3d_body.visualization.skeleton_visualizer import SkeletonVisualizer
 from sam_3d_body.metadata.mhr70 import pose_info as mhr70_pose_info
 from boxmot import ByteTrack
 
+from huggingface_hub import login
+import os
+
+hf_token = os.environ["HF_TOKEN"]
+login(token=hf_token)
+
+LIGHT_BLUE = (0.65098039, 0.74117647, 0.85882353)
+
+skeleton_visualizer = SkeletonVisualizer(line_width=2, radius=5)
+skeleton_visualizer.set_pose_meta(mhr70_pose_info)
+
+# Load estimator
+estimator = setup_sam_3d_body(hf_repo_id="facebook/sam-3d-body-dinov3")
+
 def process_image(img_path:str):
     """
     Simple processing of an image.
