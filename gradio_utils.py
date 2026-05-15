@@ -127,7 +127,7 @@ def _process_video_track_with_bbox(video_path, seed_bbox, output_path):
     Same as process_video_track_first but seeds the tracker with a
     specific bbox from frame 0 instead of picking the most-central player.
     """
-    from boxmot import ByteTrack
+    from boxmot.trackers.bytetrack.bytetrack import ByteTrack
 
     tracker      = ByteTrack()
     cap          = cv2.VideoCapture(video_path)

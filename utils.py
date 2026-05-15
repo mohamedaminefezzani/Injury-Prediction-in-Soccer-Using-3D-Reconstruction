@@ -6,7 +6,7 @@ from tools.vis_utils import visualize_sample_together, visualize_sample
 from sam_3d_body.visualization.renderer import Renderer
 from sam_3d_body.visualization.skeleton_visualizer import SkeletonVisualizer
 from sam_3d_body.metadata.mhr70 import pose_info as mhr70_pose_info
-from boxmot import ByteTrack
+from boxmot.trackers.bytetrack.bytetrack import ByteTrack
 
 from huggingface_hub import login
 import os
