@@ -22,7 +22,7 @@ from utils import (
     estimator, render_mesh_only, process_video_mesh,
     save_obj, LIGHT_BLUE, skeleton_visualizer,
 )
-from gradio_utils import _process_video_track_with_bbox
+from gradio_utils_optimized import _process_video_track_with_bbox
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="SAM 3D Body")

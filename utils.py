@@ -134,7 +134,7 @@ def process_video(video_path: str, output_path: str = "output_video.mp4"):
     return output_path
 
 # ── MHR70 joint indices (Multi-HMR / SMPL-X convention) ─────────────────────
-# These are the indices into pred_keypoints_2d / pred_keypoints_3d
+# ── MHR70 joint indices ──────────────────────────────────────────────────────
 J = {
     "pelvis":       0,
     "l_hip":        1,   "r_hip":        2,
@@ -152,226 +152,414 @@ J = {
     "l_wrist":     20,   "r_wrist":      21,
 }
 
-# ── Geometry helpers ─────────────────────────────────────────────────────────
 
-def angle_between(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+# ── Geometry helpers ──────────────────────────────────────────────────────────
+
+def angle_between(a, b, c):
     """Angle at joint b formed by segments b→a and b→c, in degrees."""
-    v1 = a - b;  v2 = c - b
+    v1 = a - b; v2 = c - b
     cos_a = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
     return float(np.degrees(np.arccos(np.clip(cos_a, -1, 1))))
 
-
-def valgus_angle(hip: np.ndarray, knee: np.ndarray, ankle: np.ndarray) -> float:
-    """
-    Knee valgus: medial deviation of the knee from the hip-ankle line.
-    Computed in the frontal plane (XY). Positive = valgus (knee caves in).
-    """
-    ref = ankle - hip
-    dev = knee  - hip
-    # Project onto frontal plane (ignore Z / depth)
-    ref2 = ref[:2];  dev2 = dev[:2]
+def valgus_angle(hip, knee, ankle):
+    """Medial knee deviation from hip-ankle line in the frontal plane (XY)."""
+    ref2 = (ankle - hip)[:2]; dev2 = (knee - hip)[:2]
     if np.linalg.norm(ref2) < 1e-6 or np.linalg.norm(dev2) < 1e-6:
         return 0.0
     cos_a = np.dot(ref2, dev2) / (np.linalg.norm(ref2) * np.linalg.norm(dev2) + 1e-8)
     return float(np.degrees(np.arccos(np.clip(cos_a, -1, 1))))
 
+def vec_angle_from_vertical(vec, use_3d=True):
+    """Angle of a vector from the vertical Y axis, in degrees."""
+    vertical = np.array([0., 1., 0.]) if use_3d else np.array([0., 1.])
+    v = vec[:3] if use_3d else vec[:2]
+    cos_a = np.dot(v, vertical) / (np.linalg.norm(v) + 1e-8)
+    return float(np.degrees(np.arccos(np.clip(cos_a, -1, 1))))
 
-# ── Per-person biomechanics ──────────────────────────────────────────────────
+def asymmetry_index(left, right):
+    """Standard asymmetry index as a percentage."""
+    mean = (abs(left) + abs(right)) / 2
+    return float(abs(left - right) / (mean + 1e-8) * 100)
 
-def compute_biomechanics(person_output: dict) -> dict:
+
+# ── Temporal buffer ───────────────────────────────────────────────────────────
+
+class TemporalBuffer:
     """
-    Compute biomechanical metrics from a single person's 3D keypoints.
-    Uses pred_keypoints_3d (camera-space 3D) when available,
-    falls back to pred_keypoints_2d.
-
-    Returns a dict with:
-        left_knee_deg, right_knee_deg   – knee flexion angles
-        l_valgus, r_valgus              – knee valgus angles (deg)
-        knee_width_ratio                – knee-width / hip-width
-        hip_drop_cm                     – pelvic drop (L vs R hip height, cm)
-        trunk_lean_deg                  – trunk lean from vertical
-        asym                            – |left_knee - right_knee|
-        low_confidence                  – True if keypoints look unreliable
+    Maintains a rolling window of per-frame metric dicts.
+    Pass the same instance across all frames of a video.
+    For single-image use, pass None to compute_biomechanics.
     """
-    # Prefer 3D keypoints; fall back to 2D
-    kp = person_output.get("pred_keypoints_3d", person_output.get("pred_keypoints_2d"))
-    use_3d = "pred_keypoints_3d" in person_output
-    scale = 100.0  # arbitrary → cm-like units for hip_drop when using 3D
+    def __init__(self, fps=30.0, window=10):
+        self.fps    = fps
+        self.window = window
+        self.frames = []   # list of metric dicts
+
+    def push(self, metrics):
+        self.frames.append(metrics)
+        if len(self.frames) > self.window:
+            self.frames.pop(0)
+
+    def last(self, key, n=2):
+        vals = [f[key] for f in self.frames[-n:] if key in f]
+        return vals
+
+    def delta(self, key):
+        vals = self.last(key, 2)
+        return (vals[-1] - vals[0]) if len(vals) == 2 else 0.0
+
+    def range_of_motion(self, key):
+        vals = [f[key] for f in self.frames if key in f]
+        return (max(vals) - min(vals)) if vals else 0.0
+
+
+# ── Main biomechanics function ────────────────────────────────────────────────
+
+def compute_biomechanics(person_output, buf=None, fps=30.0):
+    """
+    Compute all biomechanical metrics for a single person.
+
+    Args:
+        person_output : dict from estimator.process_one_image()
+        buf           : TemporalBuffer instance (None for single-image)
+        fps           : video frame rate, used for velocity calculations
+
+    Returns a flat dict with all metrics.
+    """
+    kp      = person_output.get("pred_keypoints_3d", person_output.get("pred_keypoints_2d"))
+    use_3d  = "pred_keypoints_3d" in person_output
+    verts   = person_output.get("pred_vertices", None)
 
     def pt(name):
         return kp[J[name]]
 
-    # ── Knee flexion (hip-knee-ankle angle) ──────────────────────────────────
+    # ── Centre of mass ────────────────────────────────────────────────────────
+    com = np.mean(verts, axis=0) if verts is not None else pt("pelvis")
+
+    # ── Lower body ───────────────────────────────────────────────────────────
     l_knee_deg = angle_between(pt("l_hip"),  pt("l_knee"),  pt("l_ankle"))
     r_knee_deg = angle_between(pt("r_hip"),  pt("r_knee"),  pt("r_ankle"))
-
-    # ── Valgus ───────────────────────────────────────────────────────────────
+    l_hip_deg  = angle_between(pt("spine1"), pt("l_hip"),   pt("l_knee"))
+    r_hip_deg  = angle_between(pt("spine1"), pt("r_hip"),   pt("r_knee"))
+    l_ankle_deg = angle_between(pt("l_knee"), pt("l_ankle"), pt("l_foot"))
+    r_ankle_deg = angle_between(pt("r_knee"), pt("r_ankle"), pt("r_foot"))
     l_val = valgus_angle(pt("l_hip"), pt("l_knee"), pt("l_ankle"))
     r_val = valgus_angle(pt("r_hip"), pt("r_knee"), pt("r_ankle"))
 
-    # ── Knee-width ratio ─────────────────────────────────────────────────────
     knee_w = np.linalg.norm(pt("l_knee")[:2] - pt("r_knee")[:2])
     hip_w  = np.linalg.norm(pt("l_hip")[:2]  - pt("r_hip")[:2])
     kwr    = float(knee_w / (hip_w + 1e-8))
+    hip_drop = float((pt("l_hip")[1] - pt("r_hip")[1]) * 100)
 
-    # ── Hip drop (pelvic tilt in frontal plane) ───────────────────────────────
-    # Difference in Y (vertical) between left and right hip — positive = L drops
-    hip_drop = float((pt("l_hip")[1] - pt("r_hip")[1]) * scale)
+    # Stride: horizontal ankle separation (proxy for stride length)
+    stride_len = float(np.linalg.norm((pt("l_ankle") - pt("r_ankle"))[:2]))
 
-    # ── Trunk lean from vertical ─────────────────────────────────────────────
-    # Vector from pelvis to neck; angle with the vertical axis
-    trunk_vec = pt("neck") - pt("pelvis")
-    vertical  = np.array([0.0, 1.0, 0.0]) if use_3d else np.array([0.0, 1.0])
-    trunk_vec_n = trunk_vec[:len(vertical)]
-    cos_a = np.dot(trunk_vec_n, vertical) / (np.linalg.norm(trunk_vec_n) + 1e-8)
-    trunk_lean = float(np.degrees(np.arccos(np.clip(cos_a, -1, 1))))
+    # Ground contact: foot closest to ground (min Y)
+    l_foot_h = float(pt("l_foot")[1])
+    r_foot_h = float(pt("r_foot")[1])
+    ground_contact = "left" if l_foot_h <= r_foot_h else "right"
 
-    # ── Confidence gate ───────────────────────────────────────────────────────
-    # Flag frames where both knees are nearly fully extended (likely occluded / bad fit)
-    low_conf = (l_knee_deg > 170 and r_knee_deg > 170)
+    # ── Trunk / posture ──────────────────────────────────────────────────────
+    trunk_vec   = pt("neck") - pt("pelvis")
+    trunk_lean  = vec_angle_from_vertical(trunk_vec, use_3d)
 
-    return {
-        "left_knee_deg":  l_knee_deg,
-        "right_knee_deg": r_knee_deg,
-        "l_valgus":       l_val,
-        "r_valgus":       r_val,
-        "knee_width_ratio": kwr,
-        "hip_drop_cm":    hip_drop,
-        "trunk_lean_deg": trunk_lean,
-        "asym":           abs(l_knee_deg - r_knee_deg),
-        "low_confidence": low_conf,
+    body_vec    = pt("head") - pt("l_ankle") * 0.5 - pt("r_ankle") * 0.5
+    forward_lean = vec_angle_from_vertical(body_vec, use_3d)
+
+    head_vec    = pt("head") - pt("neck")
+    head_tilt   = vec_angle_from_vertical(head_vec, use_3d)
+
+    # ── Upper body ───────────────────────────────────────────────────────────
+    l_elbow_deg = angle_between(pt("l_shoulder"), pt("l_elbow"), pt("l_wrist"))
+    r_elbow_deg = angle_between(pt("r_shoulder"), pt("r_elbow"), pt("r_wrist"))
+
+    # Shoulder rotation: angle of shoulder line vs hip line in the transverse plane
+    shoulder_vec = (pt("l_shoulder") - pt("r_shoulder"))[:2]
+    hip_vec_2d   = (pt("l_hip")      - pt("r_hip"))[:2]
+    cos_sh = np.dot(shoulder_vec, hip_vec_2d) / (
+        np.linalg.norm(shoulder_vec) * np.linalg.norm(hip_vec_2d) + 1e-8)
+    shoulder_rot = float(np.degrees(np.arccos(np.clip(cos_sh, -1, 1))))
+
+    # ── Asymmetry indices ────────────────────────────────────────────────────
+    asym_knee   = asymmetry_index(l_knee_deg, r_knee_deg)
+    asym_hip    = asymmetry_index(l_hip_deg,  r_hip_deg)
+    asym_ankle  = asymmetry_index(l_ankle_deg, r_ankle_deg)
+    asym_elbow  = asymmetry_index(l_elbow_deg, r_elbow_deg)
+    asym_valgus = asymmetry_index(l_val, r_val)
+
+    # ── Risk scores ──────────────────────────────────────────────────────────
+    # Dynamic Valgus Score (0-10): combines knee valgus + hip drop + trunk lean
+    dvs = min(10.0, (
+        max(l_val, r_val) / 3.0 +
+        abs(hip_drop) / 2.0 +
+        trunk_lean / 10.0
+    ))
+
+    # LESS proxy: knee flexion < 30deg at near-ground-contact + valgus > 10deg
+    near_ground  = min(l_foot_h, r_foot_h) < 0.05
+    less_flag    = near_ground and (
+        (l_knee_deg < 30 or r_knee_deg < 30) or
+        (l_val > 10 or r_val > 10)
+    )
+
+    low_confidence = (l_knee_deg > 170 and r_knee_deg > 170)
+
+    # ── Build base metrics dict ───────────────────────────────────────────────
+    m = {
+        # Lower body
+        "l_knee_deg":    l_knee_deg,
+        "r_knee_deg":    r_knee_deg,
+        "l_hip_deg":     l_hip_deg,
+        "r_hip_deg":     r_hip_deg,
+        "l_ankle_deg":   l_ankle_deg,
+        "r_ankle_deg":   r_ankle_deg,
+        "l_valgus":      l_val,
+        "r_valgus":      r_val,
+        "kwr":           kwr,
+        "hip_drop_cm":   hip_drop,
+        "stride_len":    stride_len,
+        "ground_contact": ground_contact,
+        # Trunk / posture
+        "trunk_lean":    trunk_lean,
+        "forward_lean":  forward_lean,
+        "head_tilt":     head_tilt,
+        # Upper body
+        "l_elbow_deg":   l_elbow_deg,
+        "r_elbow_deg":   r_elbow_deg,
+        "shoulder_rot":  shoulder_rot,
+        # Asymmetry
+        "asym_knee":     asym_knee,
+        "asym_hip":      asym_hip,
+        "asym_ankle":    asym_ankle,
+        "asym_elbow":    asym_elbow,
+        "asym_valgus":   asym_valgus,
+        # Risk
+        "dvs":           dvs,
+        "less_flag":     less_flag,
+        # CoM
+        "com":           com,
+        # Meta
+        "low_confidence": low_confidence,
+        # Temporal (defaults — overwritten below if buffer available)
+        "knee_angular_vel_l": 0.0,
+        "knee_angular_vel_r": 0.0,
+        "hip_angular_vel_l":  0.0,
+        "hip_angular_vel_r":  0.0,
+        "com_sway_lateral":   0.0,
+        "com_accel":          0.0,
+        "cadence":            0.0,
+        "rom_knee_l":         0.0,
+        "rom_knee_r":         0.0,
+        "rom_hip_l":          0.0,
+        "rom_hip_r":          0.0,
     }
 
+    # ── Temporal metrics (only when buffer is provided) ───────────────────────
+    if buf is not None:
+        buf.push(m)  # push BEFORE reading so we have at least 1 frame
 
+        dt = 1.0 / fps
+
+        # Angular velocities (deg/s)
+        m["knee_angular_vel_l"] = abs(buf.delta("l_knee_deg")) / dt if len(buf.frames) >= 2 else 0.0
+        m["knee_angular_vel_r"] = abs(buf.delta("r_knee_deg")) / dt if len(buf.frames) >= 2 else 0.0
+        m["hip_angular_vel_l"]  = abs(buf.delta("l_hip_deg"))  / dt if len(buf.frames) >= 2 else 0.0
+        m["hip_angular_vel_r"]  = abs(buf.delta("r_hip_deg"))  / dt if len(buf.frames) >= 2 else 0.0
+
+        # CoM lateral sway (units match keypoint space)
+        prev_com_vals = buf.last("com", 2)
+        if len(prev_com_vals) == 2:
+            com_delta = prev_com_vals[-1] - prev_com_vals[0]
+            m["com_sway_lateral"] = float(abs(com_delta[0]))
+            m["com_accel"]        = float(np.linalg.norm(com_delta) / dt)
+        
+        # Cadence: count ankle height zero-crossings (foot-strike events)
+        ankle_h = buf.last("ground_contact", len(buf.frames))
+        contacts = sum(1 for i in range(1, len(ankle_h)) if ankle_h[i] != ankle_h[i-1])
+        m["cadence"] = float(contacts / (len(buf.frames) / fps)) if buf.frames else 0.0
+
+        # Range of motion over buffer window
+        m["rom_knee_l"] = buf.range_of_motion("l_knee_deg")
+        m["rom_knee_r"] = buf.range_of_motion("r_knee_deg")
+        m["rom_hip_l"]  = buf.range_of_motion("l_hip_deg")
+        m["rom_hip_r"]  = buf.range_of_motion("r_hip_deg")
+
+    return m
 # ── Overlay renderer ─────────────────────────────────────────────────────────
 
-def draw_metrics_overlay(frame: np.ndarray, metrics: dict, pos: tuple = (20, 40)) -> np.ndarray:
+def draw_metrics_overlay(frame, metrics, pos=(15, 30)):
     """
-    Draw biomechanical metrics as a HUD overlay on a frame (in-place).
-    Colour-codes values: green = OK, orange = mild, red = concerning.
+    Draw all biomechanical metrics as a structured HUD split into five panels:
+    Posture | Lower Body | Upper Body | Risk | Temporal
+    Colour codes: green = OK, orange = mild, red = concerning.
     """
-    out   = frame.copy()
-    x, y  = pos
-    lh    = 30   # line height px
-    fs    = 0.65 # font scale
-    fw    = 1    # font weight
-    font  = cv2.FONT_HERSHEY_SIMPLEX
+    out  = frame.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs   = 0.52
+    fw   = 1
+    lh   = 22  # line height
+    pw   = 210 # panel width
 
-    def colour(val, warn, bad):
-        if abs(val) >= bad:   return (0, 0, 220)    # red
-        if abs(val) >= warn:  return (0, 140, 255)   # orange
-        return (0, 210, 0)                           # green
+    def col(val, warn, bad):
+        if abs(val) >= bad:  return (0, 0, 220)
+        if abs(val) >= warn: return (0, 140, 255)
+        return (0, 200, 0)
+
+    def put(img, text, x, y, color=(200, 200, 200), scale=None, weight=None):
+        cv2.putText(img, text, (x, y), font,
+                    scale or fs, color, weight or fw, cv2.LINE_AA)
+
+    def panel_bg(img, x, y, w, h, alpha=0.45):
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x, y), (x + w, y + h), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
 
     if metrics.get("low_confidence"):
-        cv2.putText(out, "LOW CONFIDENCE", (x, y), font, fs, (0,0,220), fw, cv2.LINE_AA)
+        panel_bg(out, pos[0]-5, pos[1]-20, 220, 35)
+        put(out, "LOW CONFIDENCE", pos[0], pos[1], (0, 0, 220), 0.6, 2)
         return out
 
-    lines = [
-        ("L-Knee",   f"{metrics['left_knee_deg']:.1f}deg",  colour(180-metrics['left_knee_deg'],  20, 40)),
-        ("R-Knee",   f"{metrics['right_knee_deg']:.1f}deg", colour(180-metrics['right_knee_deg'], 20, 40)),
-        ("L-Val",    f"{metrics['l_valgus']:.1f}deg",       colour(metrics['l_valgus'],  10, 20)),
-        ("R-Val",    f"{metrics['r_valgus']:.1f}deg",       colour(metrics['r_valgus'],  10, 20)),
-        ("KWR",      f"{metrics['knee_width_ratio']:.2f}",  colour(abs(metrics['knee_width_ratio']-1.0), 0.3, 0.6)),
-        ("HipDrop",  f"{metrics['hip_drop_cm']:.1f}cm",     colour(abs(metrics['hip_drop_cm']),  3, 6)),
-        ("Trunk",    f"{metrics['trunk_lean_deg']:.1f}deg", colour(metrics['trunk_lean_deg'],    20, 40)),
-        ("Asym",     f"{metrics['asym']:.1f}deg",           colour(metrics['asym'],              15, 30)),
+    panels = [
+        ("POSTURE", [
+            ("Trunk lean",    f"{metrics['trunk_lean']:.1f}deg",    col(metrics["trunk_lean"],    15, 30)),
+            ("Fwd lean",      f"{metrics['forward_lean']:.1f}deg",  col(metrics["forward_lean"],  20, 40)),
+            ("Head tilt",     f"{metrics['head_tilt']:.1f}deg",     col(metrics["head_tilt"],     10, 20)),
+            ("Hip drop",      f"{metrics['hip_drop_cm']:.1f}cm",    col(abs(metrics["hip_drop_cm"]), 3, 6)),
+            ("Shoulder rot",  f"{metrics['shoulder_rot']:.1f}deg",  col(metrics["shoulder_rot"],  15, 30)),
+        ]),
+        ("LOWER BODY", [
+            ("L-Knee",        f"{metrics['l_knee_deg']:.1f}deg",    col(180-metrics["l_knee_deg"],  20, 40)),
+            ("R-Knee",        f"{metrics['r_knee_deg']:.1f}deg",    col(180-metrics["r_knee_deg"],  20, 40)),
+            ("L-Hip",         f"{metrics['l_hip_deg']:.1f}deg",     col(180-metrics["l_hip_deg"],   25, 50)),
+            ("R-Hip",         f"{metrics['r_hip_deg']:.1f}deg",     col(180-metrics["r_hip_deg"],   25, 50)),
+            ("L-Ankle",       f"{metrics['l_ankle_deg']:.1f}deg",   col(abs(metrics["l_ankle_deg"]-90), 15, 30)),
+            ("R-Ankle",       f"{metrics['r_ankle_deg']:.1f}deg",   col(abs(metrics["r_ankle_deg"]-90), 15, 30)),
+            ("L-Valgus",      f"{metrics['l_valgus']:.1f}deg",      col(metrics["l_valgus"],  10, 20)),
+            ("R-Valgus",      f"{metrics['r_valgus']:.1f}deg",      col(metrics["r_valgus"],  10, 20)),
+            ("KWR",           f"{metrics['kwr']:.2f}",              col(abs(metrics["kwr"]-1.0), 0.3, 0.6)),
+            ("Stride",        f"{metrics['stride_len']:.2f}u",      (200, 200, 200)),
+            ("Contact",       metrics["ground_contact"],             (200, 200, 200)),
+        ]),
+        ("UPPER BODY", [
+            ("L-Elbow",       f"{metrics['l_elbow_deg']:.1f}deg",   (200, 200, 200)),
+            ("R-Elbow",       f"{metrics['r_elbow_deg']:.1f}deg",   (200, 200, 200)),
+        ]),
+        ("RISK", [
+            ("Dyn Valgus",    f"{metrics['dvs']:.1f}/10",           col(metrics["dvs"], 4, 7)),
+            ("LESS flag",     "YES" if metrics["less_flag"] else "no",
+                              (0, 0, 220) if metrics["less_flag"] else (0, 200, 0)),
+            ("Asym Knee",     f"{metrics['asym_knee']:.1f}%",       col(metrics["asym_knee"],  15, 30)),
+            ("Asym Hip",      f"{metrics['asym_hip']:.1f}%",        col(metrics["asym_hip"],   15, 30)),
+            ("Asym Ankle",    f"{metrics['asym_ankle']:.1f}%",      col(metrics["asym_ankle"], 15, 30)),
+            ("Asym Elbow",    f"{metrics['asym_elbow']:.1f}%",      col(metrics["asym_elbow"], 15, 30)),
+            ("Asym Valgus",   f"{metrics['asym_valgus']:.1f}%",     col(metrics["asym_valgus"],15, 30)),
+        ]),
+        ("TEMPORAL", [
+            ("Knee vel L",    f"{metrics['knee_angular_vel_l']:.0f}d/s", col(metrics["knee_angular_vel_l"], 200, 500)),
+            ("Knee vel R",    f"{metrics['knee_angular_vel_r']:.0f}d/s", col(metrics["knee_angular_vel_r"], 200, 500)),
+            ("Hip vel L",     f"{metrics['hip_angular_vel_l']:.0f}d/s",  col(metrics["hip_angular_vel_l"],  200, 500)),
+            ("Hip vel R",     f"{metrics['hip_angular_vel_r']:.0f}d/s",  col(metrics["hip_angular_vel_r"],  200, 500)),
+            ("CoM sway",      f"{metrics['com_sway_lateral']:.3f}u",     col(metrics["com_sway_lateral"], 0.05, 0.15)),
+            ("CoM accel",     f"{metrics['com_accel']:.2f}u/s",          (200, 200, 200)),
+            ("Cadence",       f"{metrics['cadence']:.1f}s/s",            (200, 200, 200)),
+            ("ROM Knee L",    f"{metrics['rom_knee_l']:.1f}deg",         (200, 200, 200)),
+            ("ROM Knee R",    f"{metrics['rom_knee_r']:.1f}deg",         (200, 200, 200)),
+            ("ROM Hip L",     f"{metrics['rom_hip_l']:.1f}deg",          (200, 200, 200)),
+            ("ROM Hip R",     f"{metrics['rom_hip_r']:.1f}deg",          (200, 200, 200)),
+        ]),
     ]
 
-    for label, value, col in lines:
-        text = f"{label}: {value}"
-        cv2.putText(out, text, (x, y), font, fs, col, fw, cv2.LINE_AA)
-        y += lh
+    # Layout: stack panels left to right, wrap if needed
+    img_h, img_w = out.shape[:2]
+    col_x   = pos[0]
+    col_y   = pos[1]
+    max_col_h = img_h - 20
+
+    for panel_title, rows in panels:
+        panel_h = lh * (len(rows) + 1) + 10
+        if col_y + panel_h > max_col_h:
+            col_x += pw
+            col_y  = pos[1]
+        # Background
+        panel_bg(out, col_x - 5, col_y - 18, pw - 5, panel_h)
+        # Title
+        put(out, panel_title, col_x, col_y, (255, 255, 255), 0.50, 2)
+        col_y += lh
+        for label, value, color in rows:
+            put(out, f"{label}: {value}", col_x + 4, col_y, color)
+            col_y += lh
+        col_y += 6  # gap between panels
 
     return out
 
-def render_mesh_only(outputs, faces, img_h: int, img_w: int) -> np.ndarray:
+def render_mesh_only(outputs, faces, img_h, img_w, buf=None, fps=30.0):
     """
-    Render the reconstructed 3D body mesh(es) onto a black canvas,
-    then draw 2D joint skeletons and biomechanical metrics on top.
-    All coordinates must be in the same space as img_h/img_w.
+    Render mesh(es) onto a black canvas sorted by depth,
+    then draw skeleton + full biomechanics HUD.
+
+    Args:
+        buf : TemporalBuffer instance (None for single-image use)
+        fps : video fps for temporal metric calculation
     """
     all_depths = np.stack([p["pred_cam_t"] for p in outputs], axis=0)[:, 2]
-    outputs_sorted = [outputs[idx] for idx in np.argsort(-all_depths)]
+    outputs_sorted = [outputs[i] for i in np.argsort(-all_depths)]
 
     all_pred_vertices, all_faces = [], []
-    for pid, person_output in enumerate(outputs_sorted):
-        all_pred_vertices.append(person_output["pred_vertices"] + person_output["pred_cam_t"])
-        all_faces.append(faces + len(person_output["pred_vertices"]) * pid)
+    for pid, p in enumerate(outputs_sorted):
+        all_pred_vertices.append(p["pred_vertices"] + p["pred_cam_t"])
+        all_faces.append(faces + len(p["pred_vertices"]) * pid)
     all_pred_vertices = np.concatenate(all_pred_vertices, axis=0)
     all_faces         = np.concatenate(all_faces, axis=0)
 
-    fake_pred_cam_t = (
-        np.max(all_pred_vertices[-2 * 18439:], axis=0)
-        + np.min(all_pred_vertices[-2 * 18439:], axis=0)
+    fake_cam_t = (
+        np.max(all_pred_vertices[-2*18439:], axis=0) +
+        np.min(all_pred_vertices[-2*18439:], axis=0)
     ) / 2
-    all_pred_vertices = all_pred_vertices - fake_pred_cam_t
+    all_pred_vertices -= fake_cam_t
 
     black_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
     renderer  = Renderer(focal_length=outputs_sorted[-1]["focal_length"], faces=all_faces)
-    rend = (
-        renderer(
-            all_pred_vertices, fake_pred_cam_t, black_img,
-            mesh_base_color=LIGHT_BLUE, scene_bg_color=(0, 0, 0),
-        ) * 255
-    ).astype(np.uint8)
+    rend = (renderer(
+        all_pred_vertices, fake_cam_t, black_img,
+        mesh_base_color=LIGHT_BLUE, scene_bg_color=(0, 0, 0),
+    ) * 255).astype(np.uint8)
 
-    # Skeleton + metrics — keypoints must already be in img_h/img_w space
+    # Per-person skeleton + HUD
     for person_output in outputs_sorted:
         kp2d = person_output["pred_keypoints_2d"]
         kp2d = np.concatenate([kp2d, np.ones((kp2d.shape[0], 1))], axis=-1)
         rend = skeleton_visualizer.draw_skeleton(rend, kp2d)
-        metrics = compute_biomechanics(person_output)
+        metrics = compute_biomechanics(person_output, buf=buf, fps=fps)
         rend    = draw_metrics_overlay(rend, metrics)
 
     return rend
 
 
-def process_video_mesh(video_path: str, output_path: str = "output_video.mp4"):
-    """
-    Read a video frame by frame, run the SAM 3D body estimator on each frame,
-    render the reconstructed mesh with joint skeleton and biomechanical metrics
-    overlay onto a black background, and write the result to a new video file.
-    """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise IOError(f"Cannot open video: {video_path}")
-
+def process_video_mesh(video_path, output_path="output_video.mp4"):
+    """Process all detected players per frame with full biomechanics overlay."""
+    cap    = cv2.VideoCapture(video_path)
     fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    print(f"Input  : {video_path}")
-    print(f"Frames : {total}  |  FPS : {fps:.2f}  |  Size : {width}x{height}")
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    buf    = TemporalBuffer(fps=fps, window=15)
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    print(f"Output : {output_path}")
-
+    print(f"Input: {video_path}  |  {total} frames @ {fps:.1f}fps  |  {width}x{height}")
     try:
         for frame_idx in range(total if total > 0 else int(1e9)):
             ret, frame_bgr = cap.read()
-            if not ret:
-                break
-
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            outputs   = estimator.process_one_image(frame_rgb)
-
-            if outputs:
-                rend_bgr = render_mesh_only(outputs, estimator.faces, height, width)
-            else:
-                rend_bgr = np.zeros((height, width, 3), dtype=np.uint8)
-
-            writer.write(rend_bgr)
-
+            if not ret: break
+            outputs = estimator.process_one_image(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            rend    = render_mesh_only(outputs, estimator.faces, height, width, buf=buf, fps=fps) if outputs else np.zeros((height, width, 3), dtype=np.uint8)
+            writer.write(rend)
             if (frame_idx + 1) % 10 == 0:
-                print(f"  processed {frame_idx + 1}/{total} frames…")
-
+                print(f"  {frame_idx+1}/{total} frames")
     finally:
         cap.release()
         writer.release()
-
-    print(f"Done – saved to {output_path}")
+    print(f"Done -> {output_path}")
     return output_path
 
 # ── Colour-based jersey fingerprint ─────────────────────────────────────────
