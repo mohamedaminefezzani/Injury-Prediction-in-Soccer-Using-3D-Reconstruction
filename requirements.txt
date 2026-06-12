@@ -45,7 +45,7 @@ triton
 decord
 psutil
 notebook
-boxmot
+boxmot==21.0.0
 braceexpand
 matplotlib
 roma
