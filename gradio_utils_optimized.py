@@ -333,7 +333,7 @@ def _process_video_track_with_bbox(
     * VideoWriter runs in a background thread                 → hides ~3 ms/frame
     * Renderer object is reused across frames                 → avoids scene setup cost
     """
-    from boxmot.trackers.bytetrack.bytetrack import ByteTrack
+    from boxmot.trackers import ByteTrack
     from utils import TemporalBuffer
 
     tracker   = ByteTrack()
