@@ -162,12 +162,26 @@ def angle_between(a, b, c):
     return float(np.degrees(np.arccos(np.clip(cos_a, -1, 1))))
 
 def valgus_angle(hip, knee, ankle):
-    """Medial knee deviation from hip-ankle line in the frontal plane (XY)."""
-    ref2 = (ankle - hip)[:2]; dev2 = (knee - hip)[:2]
-    if np.linalg.norm(ref2) < 1e-6 or np.linalg.norm(dev2) < 1e-6:
+    """
+    Medial knee deviation from the hip-ankle mechanical axis, in degrees.
+
+    Projects onto the XZ plane (frontal plane in MHR/camera space where Y is
+    vertical). XY projection was wrong — it mixed horizontal with vertical,
+    producing nonsensical values (~170deg) instead of the expected 0-25deg range.
+
+    Positive = valgus (knee collapses inward toward midline).
+    Near-zero = neutral alignment.
+    """
+    # Project onto XZ (frontal plane): axis 0 = X (lateral), axis 2 = Z (depth)
+    ref = np.array([ankle[0] - hip[0], ankle[2] - hip[2]])   # hip→ankle in XZ
+    dev = np.array([knee[0]  - hip[0], knee[2]  - hip[2]])   # hip→knee  in XZ
+    if np.linalg.norm(ref) < 1e-6 or np.linalg.norm(dev) < 1e-6:
         return 0.0
-    cos_a = np.dot(ref2, dev2) / (np.linalg.norm(ref2) * np.linalg.norm(dev2) + 1e-8)
-    return float(np.degrees(np.arccos(np.clip(cos_a, -1, 1))))
+    cos_a = np.dot(ref, dev) / (np.linalg.norm(ref) * np.linalg.norm(dev) + 1e-8)
+    angle = float(np.degrees(np.arccos(np.clip(cos_a, -1, 1))))
+    # Cross product Z-component tells us which side the knee deviates to
+    cross = ref[0] * dev[1] - ref[1] * dev[0]
+    return angle if cross >= 0 else -angle
 
 def vec_angle_from_vertical(vec, use_3d=True):
     """Angle of a vector from the vertical Y axis, in degrees."""
@@ -246,13 +260,15 @@ def compute_biomechanics(person_output, buf=None, fps=30.0):
     l_val = valgus_angle(pt("l_hip"), pt("l_knee"), pt("l_ankle"))
     r_val = valgus_angle(pt("r_hip"), pt("r_knee"), pt("r_ankle"))
 
-    knee_w = np.linalg.norm(pt("l_knee")[:2] - pt("r_knee")[:2])
-    hip_w  = np.linalg.norm(pt("l_hip")[:2]  - pt("r_hip")[:2])
+    # KWR: lateral separation only (X axis) — not XY which mixes vertical
+    knee_w = abs(float(pt("l_knee")[0] - pt("r_knee")[0]))
+    hip_w  = abs(float(pt("l_hip")[0]  - pt("r_hip")[0]))
     kwr    = float(knee_w / (hip_w + 1e-8))
     hip_drop = float((pt("l_hip")[1] - pt("r_hip")[1]) * 100)
 
     # Stride: horizontal ankle separation (proxy for stride length)
-    stride_len = float(np.linalg.norm((pt("l_ankle") - pt("r_ankle"))[:2]))
+    # Stride: lateral ankle separation (X axis only — forward/back Z excluded)
+    stride_len = float(abs(pt("l_ankle")[0] - pt("r_ankle")[0]))
 
     # Ground contact: foot closest to ground (min Y)
     l_foot_h = float(pt("l_foot")[1])
